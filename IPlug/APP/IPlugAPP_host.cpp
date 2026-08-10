@@ -247,6 +247,74 @@ std::optional<uint32_t> IPlugAPPHost::GetAudioDeviceID(const char* deviceNameToT
   return std::nullopt;
 }
 
+bool IPlugAPPHost::AudioDeviceSupportsRoute(uint32_t deviceID, ERoute direction) const
+{
+  const auto& deviceIDs = direction == ERoute::kInput ? mAudioInputDevIDs : mAudioOutputDevIDs;
+
+  if (std::find(deviceIDs.begin(), deviceIDs.end(), deviceID) == deviceIDs.end())
+    return false;
+
+  // RtAudio 6 reports an unusable device as an empty DeviceInfo (0 channels) instead of throwing, so the
+  // channel count below also covers what RtAudio 5's DeviceInfo::probed used to guard.
+  const RtAudio::DeviceInfo info = mDAC->getDeviceInfo(deviceID);
+  const uint32_t requiredChannels = static_cast<uint32_t>(std::max(0, mIPlug->MaxNChannels(direction)));
+  const uint32_t availableChannels = direction == ERoute::kInput ? info.inputChannels : info.outputChannels;
+
+  return availableChannels >= requiredChannels;
+}
+
+std::optional<uint32_t> IPlugAPPHost::GetAudioDeviceID(const char* deviceNameToTest, ERoute direction) const
+{
+  const auto& deviceIDs = direction == ERoute::kInput ? mAudioInputDevIDs : mAudioOutputDevIDs;
+
+  for (auto deviceID : deviceIDs)
+  {
+    if (AudioDeviceSupportsRoute(deviceID, direction) && std::string_view(deviceNameToTest) == GetAudioDeviceName(deviceID))
+      return deviceID;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<uint32_t> IPlugAPPHost::GetFallbackAudioDevice(ERoute direction) const
+{
+  const auto& defaultDevice = direction == ERoute::kInput ? mDefaultInputDev : mDefaultOutputDev;
+
+  if (defaultDevice && AudioDeviceSupportsRoute(defaultDevice.value(), direction))
+    return defaultDevice;
+
+  const auto& deviceIDs = direction == ERoute::kInput ? mAudioInputDevIDs : mAudioOutputDevIDs;
+
+  for (auto deviceID : deviceIDs)
+  {
+    if (AudioDeviceSupportsRoute(deviceID, direction))
+      return deviceID;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<uint32_t> IPlugAPPHost::GetFallbackDuplexAudioDevice() const
+{
+  auto supportsBoth = [this](uint32_t deviceID) {
+    return AudioDeviceSupportsRoute(deviceID, ERoute::kInput) && AudioDeviceSupportsRoute(deviceID, ERoute::kOutput);
+  };
+
+  if (mDefaultOutputDev && supportsBoth(mDefaultOutputDev.value()))
+    return mDefaultOutputDev;
+
+  if (mDefaultInputDev && supportsBoth(mDefaultInputDev.value()))
+    return mDefaultInputDev;
+
+  for (auto deviceID : mAudioOutputDevIDs)
+  {
+    if (supportsBoth(deviceID))
+      return deviceID;
+  }
+
+  return std::nullopt;
+}
+
 int IPlugAPPHost::GetMIDIPortNumber(ERoute direction, const char* nameToTest) const
 {
   int start = 1;
@@ -291,6 +359,8 @@ void IPlugAPPHost::ProbeAudioIO()
 {
   mAudioInputDevIDs.clear();
   mAudioOutputDevIDs.clear();
+  mDefaultInputDev.reset();
+  mDefaultOutputDev.reset();
 
   if (!mDAC)
     return;
@@ -430,62 +500,93 @@ bool IPlugAPPHost::TryToChangeAudio()
   if (mNoIO || IsScreenshotMode())
     return true;
 
+  std::optional<uint32_t> inputID;
+  std::optional<uint32_t> outputID;
+  bool stateChanged = false;
+  bool requiresDuplexDevice = false;
+
 #if defined OS_WIN
-  // ASIO has one device, use the output for the input ID
-  auto inputID = GetAudioDeviceID(mState.mAudioDriverType == kDeviceASIO ? mState.mAudioOutDev.Get() : mState.mAudioInDev.Get());
+  if (mState.mAudioDriverType == kDeviceASIO)
+  {
+    // ASIO has one device, so it has to serve both input and output
+    requiresDuplexDevice = true;
+    outputID = GetAudioDeviceID(mState.mAudioOutDev.Get(), ERoute::kOutput);
+
+    if (outputID && AudioDeviceSupportsRoute(outputID.value(), ERoute::kInput))
+    {
+      inputID = outputID;
+
+      const std::string deviceName = GetAudioDeviceName(outputID.value());
+
+      if (std::string_view(mState.mAudioInDev.Get()) != deviceName)
+      {
+        mState.mAudioInDev.Set(deviceName.c_str());
+        stateChanged = true;
+      }
+    }
+    else
+    {
+      inputID = outputID = GetFallbackDuplexAudioDevice();
+
+      if (inputID)
+      {
+        const std::string deviceName = GetAudioDeviceName(inputID.value());
+        mState.mAudioInDev.Set(deviceName.c_str());
+        mState.mAudioOutDev.Set(deviceName.c_str());
+        stateChanged = true;
+      }
+    }
+  }
+  else
+  {
+    inputID = GetAudioDeviceID(mState.mAudioInDev.Get(), ERoute::kInput);
+    outputID = GetAudioDeviceID(mState.mAudioOutDev.Get(), ERoute::kOutput);
+  }
 #elif defined OS_MAC
-  auto inputID = GetAudioDeviceID(mState.mAudioInDev.Get());
+  inputID = GetAudioDeviceID(mState.mAudioInDev.Get(), ERoute::kInput);
+  outputID = GetAudioDeviceID(mState.mAudioOutDev.Get(), ERoute::kOutput);
 #else
   #error NOT IMPLEMENTED
 #endif
-  auto outputID = GetAudioDeviceID(mState.mAudioOutDev.Get());
 
-  bool failedToFindDevice = false;
-  bool resetToDefault = false;
-
-  if (!inputID)
+  if (!requiresDuplexDevice && !inputID)
   {
-    if (mDefaultInputDev)
-    {
-      resetToDefault = true;
-      inputID = mDefaultInputDev;
+    inputID = GetFallbackAudioDevice(ERoute::kInput);
 
-      if (mAudioInputDevIDs.size())
-        mState.mAudioInDev.Set(GetAudioDeviceName(inputID.value()).c_str());
+    if (inputID)
+    {
+      mState.mAudioInDev.Set(GetAudioDeviceName(inputID.value()).c_str());
+      stateChanged = true;
     }
-    else
-      failedToFindDevice = true;
   }
 
-  if (!outputID)
+  if (!requiresDuplexDevice && !outputID)
   {
-    if (mDefaultOutputDev)
-    {
-      resetToDefault = true;
-      outputID = mDefaultOutputDev;
+    outputID = GetFallbackAudioDevice(ERoute::kOutput);
 
-      if (mAudioOutputDevIDs.size())
-        mState.mAudioOutDev.Set(GetAudioDeviceName(outputID.value()).c_str());
+    if (outputID)
+    {
+      mState.mAudioOutDev.Set(GetAudioDeviceName(outputID.value()).c_str());
+      stateChanged = true;
     }
-    else
-      failedToFindDevice = true;
   }
 
-  if (resetToDefault)
+  if (!inputID || !outputID)
   {
-    DBGMSG("Couldn't find previous audio device, reseting to default\n");
+    MessageBox(gHWND, "No compatible audio input/output device pair was found. Please check Preferences.", "Error", MB_OK);
+    return false;
+  }
+
+  const bool audioStarted = InitAudio(inputID.value(), outputID.value(), mState.mAudioSR, mState.mBufferSize);
+
+  if (audioStarted && stateChanged)
+  {
+    DBGMSG("previous audio device pair was invalid; using a compatible fallback
+");
     UpdateINI();
   }
 
-  if (failedToFindDevice)
-    MessageBox(gHWND, "Please check the audio settings", "Error", MB_OK);
-
-  if (inputID && outputID)
-  {
-    return InitAudio(inputID.value(), outputID.value(), mState.mAudioSR, mState.mBufferSize);
-  }
-
-  return false;
+  return audioStarted;
 }
 
 bool IPlugAPPHost::SelectMIDIDevice(ERoute direction, const char* pPortName)
@@ -608,6 +709,13 @@ bool IPlugAPPHost::InitAudio(uint32_t inID, uint32_t outID, uint32_t sr, uint32_
   iParams.nChannels = GetPlug()->MaxNChannels(ERoute::kInput);
   if (iParams.nChannels > 0)
   {
+    if (inputInfo.inputChannels < iParams.nChannels)
+    {
+      DBGMSG("selected input device does not provide the required channels
+");
+      return false;
+    }
+
     mState.mAudioInChanL = ClampFirstChannel(mState.mAudioInChanL, inputInfo.inputChannels, iParams.nChannels);
     mState.mAudioInChanR =
       iParams.nChannels > 1 ? std::min(mState.mAudioInChanL + 1, inputInfo.inputChannels) : mState.mAudioInChanL;
@@ -618,6 +726,13 @@ bool IPlugAPPHost::InitAudio(uint32_t inID, uint32_t outID, uint32_t sr, uint32_
   oParams.nChannels = GetPlug()->MaxNChannels(ERoute::kOutput);
   if (oParams.nChannels > 0)
   {
+    if (outputInfo.outputChannels < oParams.nChannels)
+    {
+      DBGMSG("selected output device does not provide the required channels
+");
+      return false;
+    }
+
     mState.mAudioOutChanL = ClampFirstChannel(mState.mAudioOutChanL, outputInfo.outputChannels, oParams.nChannels);
     mState.mAudioOutChanR =
       oParams.nChannels > 1 ? std::min(mState.mAudioOutChanL + 1, outputInfo.outputChannels) : mState.mAudioOutChanL;

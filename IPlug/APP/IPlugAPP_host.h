@@ -233,6 +233,15 @@ public:
 
   IPlugAPP* GetPlug() { return mIPlug.get(); }
 private:
+  /** Like GetAudioDeviceID(name), but only matches a device that can serve \c direction (see AudioDeviceSupportsRoute) */
+  std::optional<uint32_t> GetAudioDeviceID(const char* name, ERoute direction) const;
+  /** True if the device is listed for \c direction and offers at least as many channels as the plug-in needs on that route */
+  bool AudioDeviceSupportsRoute(uint32_t deviceID, ERoute direction) const;
+  /** The default device for \c direction if usable, otherwise the first usable one */
+  std::optional<uint32_t> GetFallbackAudioDevice(ERoute direction) const;
+  /** A single device usable for both input and output, as ASIO requires */
+  std::optional<uint32_t> GetFallbackDuplexAudioDevice() const;
+
   std::unique_ptr<IPlugAPP> mIPlug = nullptr;
   std::unique_ptr<RtAudio> mDAC = nullptr;
   std::unique_ptr<RtMidiIn> mMidiIn = nullptr;
