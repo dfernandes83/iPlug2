@@ -362,9 +362,26 @@ void IGraphicsSkia::OnViewDestroyed()
 
 void IGraphicsSkia::DrawResize()
 {
+  // absolute-stereo-nam fork: ported from upstream iPlug2 commit 4d0c81dc700d90e66e23cd3f076efdeedbbba49d
+  // ("NanoVG: Only create new FBOs at the end of a drag resize gesture", oli/iPlug2, 2020-02-09,
+  // branch graphics/resize_ram -- never merged into neuralampmodeler-main, and only ever applied to
+  // the NanoVG backend upstream, not Skia). Recreating the whole backing render surface (a GPU
+  // render target under IGRAPHICS_GL/METAL, or a full CPU raster surface otherwise) on every single
+  // mouse-move tick of a drag-resize gesture is expensive; if the OS delivers move events faster
+  // than that recreation-plus-repaint can keep up, the host window and this surface's actual
+  // contents fall out of sync mid-drag -- reproduced as a real, deterministic freeze-then-desync in
+  // REAPER (window visibly grows/moves while the plugin's own content stays pinned at a stale size,
+  // "torto"). Skipping the recreation entirely while GetResizingInProcess() is true, and recreating
+  // exactly once when the gesture actually ends (IGraphics::EndDragResize(), patched to call
+  // DrawResize() there -- see that function), is the same fix upstream shipped for NanoVG, just
+  // applied to every branch below instead of one NanoVG-specific FBO call. See docs/decisions.md and
+  // docs/iplug2-fork-status.md for the fuller investigation and owner authorization.
+  if (GetResizingInProcess())
+    return;
+
   auto w = static_cast<int>(std::ceil(static_cast<float>(WindowWidth()) * GetScreenScale()));
   auto h = static_cast<int>(std::ceil(static_cast<float>(WindowHeight()) * GetScreenScale()));
-  
+
 #if defined IGRAPHICS_GL || defined IGRAPHICS_METAL
   if (mGrContext.get())
   {
