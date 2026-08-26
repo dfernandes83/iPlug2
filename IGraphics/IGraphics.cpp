@@ -1983,7 +1983,7 @@ void IGraphics::CreatePopupMenu(IControl& control, IPopupMenu& menu, const IRECT
 void IGraphics::EndDragResize()
 {
   mResizingInProcess = false;
-  
+
   if (GetResizerMode() == EUIResizerMode::Scale)
   {
     // If scaling up we may want to load in high DPI bitmaps if scale > 1.
@@ -1992,6 +1992,12 @@ void IGraphics::EndDragResize()
   }
   else if (mCornerResizer)
     mCornerResizer->SetDirty(false);
+
+  // absolute-stereo-nam fork: ported from upstream commit 4d0c81dc700d90e66e23cd3f076efdeedbbba49d
+  // (see IGraphicsSkia::DrawResize()'s own comment for the full reasoning) -- DrawResize() now skips
+  // its expensive backing-surface recreation for as long as mResizingInProcess is true (just cleared
+  // above), so this call is what actually recreates it, once, at the gesture's real final size.
+  DrawResize();
 }
 
 void IGraphics::StartLayer(IControl* pControl, const IRECT& r, bool cacheable)
