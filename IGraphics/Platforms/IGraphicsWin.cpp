@@ -931,6 +931,24 @@ void IGraphicsWin::PlatformResize(bool parentHasResized)
     {
       SetWindowPos(pGrandparent, 0, 0, 0, grandparentW + dw, grandparentH + dh, SETPOS_FLAGS);
     }
+
+    // absolute-stereo-nam fork: this function is called on every WM_MOUSEMOVE tick of a live
+    // corner-resizer drag (IGraphics::OnDragResize() -> Resize() -> here), and when the plugin is
+    // hosted as a VST3 child window (IsChildWindow(mPlugWnd) above), that means SetWindowPos() just
+    // ran on our own window AND its parent/grandparent host windows -- resizing/repositioning a
+    // window chain like that is a well-documented way for Win32 to silently drop whichever window
+    // currently holds SetCapture(), even when nothing in THIS process asked for that. Once capture
+    // is gone, WM_MOUSEMOVE's own `GetCapture() == hWnd` guard (see the WM_MOUSEMOVE case in this
+    // file) stops forwarding drag events to us at all -- the gesture goes silently dead mid-drag,
+    // GetResizingInProcess() stays true forever (nothing left to call EndDragResize()), and the host
+    // window keeps growing from further OS-level dragging while our own content is frozen at
+    // whatever size it last got to render -- reproduced as a real, deterministic freeze in REAPER
+    // (window grows, plugin content stays pinned and "torto"), confirmed to persist even after
+    // fixing DrawResize()'s own resize-time cost (see that function's own comment) alone. Re-
+    // asserting capture here, immediately after the cascade that risks losing it, only while a drag
+    // is actually still in progress, keeps the gesture alive instead of leaving it stuck.
+    if (GetResizingInProcess() && GetCapture() != mPlugWnd)
+      SetCapture(mPlugWnd);
   }
 }
 
