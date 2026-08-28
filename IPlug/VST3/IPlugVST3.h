@@ -75,6 +75,7 @@ public:
   Steinberg::tresult PLUGIN_API terminate() override;
   Steinberg::tresult PLUGIN_API setBusArrangements(Steinberg::Vst::SpeakerArrangement* pInputs, Steinberg::int32 numIns, Steinberg::Vst::SpeakerArrangement* pOutputs, Steinberg::int32 numOuts) override;
   Steinberg::tresult PLUGIN_API setActive(Steinberg::TBool state) override;
+  Steinberg::tresult PLUGIN_API activateBus(Steinberg::Vst::MediaType type, Steinberg::Vst::BusDirection dir, Steinberg::int32 index, Steinberg::TBool state) override;
   Steinberg::tresult PLUGIN_API setupProcessing(Steinberg::Vst::ProcessSetup& newSetup) override;
   Steinberg::tresult PLUGIN_API setProcessing (Steinberg::TBool state) override;
   Steinberg::tresult PLUGIN_API process(Steinberg::Vst::ProcessData& data) override;

@@ -80,6 +80,29 @@ tresult PLUGIN_API IPlugVST3::setActive(TBool state)
   return SingleComponentEffect::setActive(state);
 }
 
+tresult PLUGIN_API IPlugVST3::activateBus(MediaType type, BusDirection dir, int32 index, TBool state)
+{
+  TRACE
+
+  tresult result = SingleComponentEffect::activateBus(type, dir, index, state);
+
+  // Keep IPlug's channel-connection state in step with the host activating / de-activating an
+  // input side-bus (routing or removing a sidechain send). This is a control-thread call that
+  // happens independent of the audio callback, so IsChannelConnected() stays correct even with
+  // the transport stopped (dfernandes83 fork -- see AbsoluteStereoGate D-182). Bus 0 is the main
+  // input; buses >= 1 map to the channels after it.
+  if (result == kResultTrue && type == kAudio && dir == kInput && index >= 1 && index < MaxNBuses(ERoute::kInput))
+  {
+    int chanOffset = 0;
+    for (int i = 0; i < index; i++)
+      chanOffset += MaxNChannelsForBus(ERoute::kInput, i);
+
+    SetChannelConnections(ERoute::kInput, chanOffset, MaxNChannelsForBus(ERoute::kInput, index), (bool) state);
+  }
+
+  return result;
+}
+
 tresult PLUGIN_API IPlugVST3::setupProcessing(ProcessSetup& newSetup)
 {
   TRACE
