@@ -1931,11 +1931,14 @@ static HFONT GetHFont(const char* fontName, int weight, bool italic, bool underl
   {
     wchar_t selectedFontName[64] = {'\0'};
 
-    SelectFont(hdc, font);
+    HGDIOBJ oldFont = SelectObject(hdc, font);
     GetTextFaceW(hdc, 64, selectedFontName);
+    SelectObject(hdc, oldFont); // a font can only be deleted once it is no longer selected into a DC
+
     if (strcmp(UTF16AsUTF8(selectedFontName).Get(), fontName))
     {
       DeleteObject(font);
+      ReleaseDC(NULL, hdc); // this early return skipped the ReleaseDC() below and leaked the DC
       return nullptr;
     }
   }
@@ -2011,9 +2014,15 @@ PlatformFontPtr IGraphicsWin::LoadPlatformFont(const char* fontID, void* pData, 
   void* pFontMem = pData;
   int resSize = dataSize;
 
-  pFont = std::make_unique<InstalledFont>(pFontMem, resSize);
+  // Install a font once per fontID. This cache is shared by every editor of every plug-in instance, and
+  // StaticStorage::Add() appends without looking for an existing key, so installing it again on each editor open
+  // left one more AddFontMemResourceEx() registration (a GDI object plus a copy of the font data) behind every time.
+  const bool alreadyInstalled = fontStorage.Find(fontID) != nullptr;
 
-  if (pFontMem && pFont && pFont->IsValid())
+  if (!alreadyInstalled)
+    pFont = std::make_unique<InstalledFont>(pFontMem, resSize);
+
+  if (pFontMem && (alreadyInstalled || (pFont && pFont->IsValid())))
   {
     IFontInfo fontInfo(pFontMem, resSize, 0);
     WDL_String family = fontInfo.GetFamily();
@@ -2025,7 +2034,9 @@ PlatformFontPtr IGraphicsWin::LoadPlatformFont(const char* fontID, void* pData, 
 
     if (font)
     {
-      fontStorage.Add(pFont.release(), fontID);
+      if (pFont)
+        fontStorage.Add(pFont.release(), fontID);
+
       return PlatformFontPtr(new Font(font, "", false));
     }
   }
@@ -2059,10 +2070,12 @@ void IGraphicsWin::StartVBlankThread(HWND hWnd)
 
 void IGraphicsWin::StopVBlankThread()
 {
-  if (mVBlankThread != INVALID_HANDLE_VALUE)
+  // CreateThread() returns NULL on failure, and the default member value is INVALID_HANDLE_VALUE
+  if (mVBlankThread != INVALID_HANDLE_VALUE && mVBlankThread != nullptr)
   {
     mVBlankShutdown = true;
     ::WaitForSingleObject(mVBlankThread, 10000);
+    ::CloseHandle(mVBlankThread); // the handle CreateThread() returned stays open until it is closed: one leaked handle per editor open otherwise
     mVBlankThread = INVALID_HANDLE_VALUE;
     mVBlankWindow = 0;
   }
@@ -2180,7 +2193,9 @@ DWORD IGraphicsWin::OnVBlankRun()
             // failed
             adapterLastFailTime = ::GetTickCount();
           }
-          DeleteDC(hDC);
+          // A DC from GetDC() has to be given back with ReleaseDC(); DeleteDC() fails on it and leaves the DC allocated
+          if (hDC)
+            ReleaseDC(mVBlankWindow, hDC);
         }
       }
 

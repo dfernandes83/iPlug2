@@ -55,7 +55,16 @@ struct HFontHolder
     GetObjectW(hfont, sizeof(LOGFONTW), &lFont);
     mHFont = CreateFontIndirectW(&lFont);
   }
-  
+
+  ~HFontHolder()
+  {
+    if (mHFont)
+      DeleteObject(mHFont);
+  }
+
+  HFontHolder(const HFontHolder&) = delete;
+  HFontHolder& operator=(const HFontHolder&) = delete;
+
   HFONT mHFont;
 };
 
