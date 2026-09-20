@@ -63,6 +63,10 @@ IPlugVST3ProcessorBase::IPlugVST3ProcessorBase(Config c, IPlugAPIBase& plug)
   
   // Make sure the process context is predictably initialised in case it is used before process is called
   memset(&mProcessContext, 0, sizeof(ProcessContext));
+
+#if IPLUG_VST3_SAMPLE_ACCURATE_PARAMS
+  mParamPoints.reserve(IPLUG_VST3_MAX_PARAM_POINTS); // once, here: the audio thread must never grow it
+#endif
 }
 
 void IPlugVST3ProcessorBase::ProcessMidiIn(IEventList* pEventList, IPlugQueue<IMidiMsg>& editorQueue, IPlugQueue<IMidiMsg>& processorQueue)
@@ -207,12 +211,42 @@ void IPlugVST3ProcessorBase::ProcessMidiOut(IPlugQueue<SysExData>& sysExQueue, S
   }
 }
 
-void IPlugVST3ProcessorBase::AttachBuffers(ERoute direction, int idx, int n, AudioBusBuffers& pBus, int nFrames, int32 sampleSize)
+void IPlugVST3ProcessorBase::AttachBuffers(ERoute direction, int idx, int n, AudioBusBuffers& pBus, int nFrames, int32 sampleSize, int offset)
 {
+  if (offset == 0)
+  {
+    if (sampleSize == kSample32)
+      IPlugProcessor::AttachBuffers(direction, idx, n, pBus.channelBuffers32, nFrames);
+    else if (sampleSize == kSample64)
+      IPlugProcessor::AttachBuffers(direction, idx, n, pBus.channelBuffers64, nFrames);
+
+    return;
+  }
+
+  // A sub-block: hand over per-channel pointers shifted by offset. The array has a fixed size so nothing is
+  // allocated on the audio thread; ProcessSampleAccurate() never splits a block whose buses are wider than this.
+  constexpr int kMaxShiftedChannels = 64;
+  assert(n <= kMaxShiftedChannels);
+  const int nChans = std::min(n, kMaxShiftedChannels);
+
   if (sampleSize == kSample32)
-    IPlugProcessor::AttachBuffers(direction, idx, n, pBus.channelBuffers32, nFrames);
+  {
+    Sample32* shifted[kMaxShiftedChannels];
+
+    for (int c = 0; c < nChans; ++c)
+      shifted[c] = pBus.channelBuffers32[c] + offset;
+
+    IPlugProcessor::AttachBuffers(direction, idx, nChans, shifted, nFrames);
+  }
   else if (sampleSize == kSample64)
-    IPlugProcessor::AttachBuffers(direction, idx, n, pBus.channelBuffers64, nFrames);
+  {
+    Sample64* shifted[kMaxShiftedChannels];
+
+    for (int c = 0; c < nChans; ++c)
+      shifted[c] = pBus.channelBuffers64[c] + offset;
+
+    IPlugProcessor::AttachBuffers(direction, idx, nChans, shifted, nFrames);
+  }
 }
 
 bool IPlugVST3ProcessorBase::SetupProcessing(const ProcessSetup& setup, ProcessSetup& storedSetup)
@@ -271,14 +305,65 @@ void IPlugVST3ProcessorBase::PrepareProcessContext(ProcessData& data, ProcessSet
   SetRenderingOffline(offline);
 }
 
+void IPlugVST3ProcessorBase::ApplyParameterChange(int idx, double value, int offsetSamples, IPlugQueue<IMidiMsg>& fromProcessor)
+{
+  switch (idx)
+  {
+    case kBypassParam:
+    {
+      const bool bypassed = (value > 0.5);
+
+      if (bypassed != GetBypassed())
+        SetBypassed(bypassed);
+
+      break;
+    }
+    default:
+    {
+      if (idx >= 0 && idx < mPlug.NParams())
+      {
+#ifdef PARAMS_MUTEX
+        mPlug.mParams_mutex.Enter();
+#endif
+        mPlug.GetParam(idx)->SetNormalized(value);
+
+        // In VST3 non distributed the same parameter value is also set via IPlugVST3Controller::setParamNormalized(ParamID tag, ParamValue value)
+        mPlug.OnParamChange(idx, kHost, offsetSamples);
+#ifdef PARAMS_MUTEX
+        mPlug.mParams_mutex.Leave();
+#endif
+      }
+      else if (idx >= kMIDICCParamStartIdx)
+      {
+        int index = idx - kMIDICCParamStartIdx;
+        int channel = index / kCountCtrlNumber;
+        int ctrlr = index % kCountCtrlNumber;
+
+        IMidiMsg msg;
+
+        if (ctrlr == kAfterTouch)
+          msg.MakeChannelATMsg((int) (value * 127.), offsetSamples, channel);
+        else if (ctrlr == kPitchBend)
+          msg.MakePitchWheelMsg((value * 2.)-1., channel, offsetSamples);
+        else
+          msg.MakeControlChangeMsg((IMidiMsg::EControlChangeMsg) ctrlr, value, channel, offsetSamples);
+
+        fromProcessor.Push(msg);
+        ProcessMidiMsg(msg);
+      }
+    }
+      break;
+  }
+}
+
 void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data, IPlugQueue<IMidiMsg>& fromProcessor)
 {
   IParameterChanges* paramChanges = data.inputParameterChanges;
-  
+
   if (paramChanges)
   {
     int32 numParamsChanged = paramChanges->getParameterCount();
-    
+
     for (int32 i = 0; i < numParamsChanged; i++)
     {
       IParamValueQueue* paramQueue = paramChanges->getParameterData(i);
@@ -287,67 +372,20 @@ void IPlugVST3ProcessorBase::ProcessParameterChanges(ProcessData& data, IPlugQue
         int32 numPoints = paramQueue->getPointCount();
         int32 offsetSamples;
         double value;
-        
+
+        // Default behaviour: only the last point of each queue is applied, at the start of the block.
+        // See IPLUG_VST3_SAMPLE_ACCURATE_PARAMS / ProcessSampleAccurate() for the sample-accurate alternative.
         if (paramQueue->getPoint(numPoints - 1,  offsetSamples, value) == kResultTrue)
-        {
-          int idx = paramQueue->getParameterId();
-          
-          switch (idx)
-          {
-            case kBypassParam:
-            {
-              const bool bypassed = (value > 0.5);
-
-              if (bypassed != GetBypassed())
-                SetBypassed(bypassed);
-
-              break;
-            }
-            default:
-            {
-              if (idx >= 0 && idx < mPlug.NParams())
-              {
-#ifdef PARAMS_MUTEX
-                mPlug.mParams_mutex.Enter();
-#endif
-                mPlug.GetParam(idx)->SetNormalized(value);
-              
-                // In VST3 non distributed the same parameter value is also set via IPlugVST3Controller::setParamNormalized(ParamID tag, ParamValue value)
-                mPlug.OnParamChange(idx, kHost, offsetSamples);
-#ifdef PARAMS_MUTEX
-                mPlug.mParams_mutex.Leave();
-#endif
-              }
-              else if (idx >= kMIDICCParamStartIdx)
-              {
-                int index = idx - kMIDICCParamStartIdx;
-                int channel = index / kCountCtrlNumber;
-                int ctrlr = index % kCountCtrlNumber;
-
-                IMidiMsg msg;
-
-                if (ctrlr == kAfterTouch)
-                  msg.MakeChannelATMsg((int) (value * 127.), offsetSamples, channel);
-                else if (ctrlr == kPitchBend)
-                  msg.MakePitchWheelMsg((value * 2.)-1., channel, offsetSamples);
-                else
-                  msg.MakeControlChangeMsg((IMidiMsg::EControlChangeMsg) ctrlr, value, channel, offsetSamples);
-
-                fromProcessor.Push(msg);
-                ProcessMidiMsg(msg);
-              }
-            }
-              break;
-          }
-        }
+          ApplyParameterChange(static_cast<int>(paramQueue->getParameterId()), value, offsetSamples, fromProcessor);
       }
     }
   }
 }
 
-void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup, const BusList& ins, const BusList& outs)
+void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup, const BusList& ins, const BusList& outs, int offset, int nFrames)
 {
   int32 sampleSize = setup.symbolicSampleSize;
+  const int frames = nFrames >= 0 ? nFrames : data.numSamples;
     
   if (sampleSize == kSample32 || sampleSize == kSample64)
   {
@@ -374,16 +412,16 @@ void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup
           SetChannelConnections(ERoute::kInput, 0, data.inputs[0].numChannels, true);
         }
         
-        AttachBuffers(ERoute::kInput, 0, data.inputs[0].numChannels, data.inputs[0], data.numSamples, sampleSize);
+        AttachBuffers(ERoute::kInput, 0, data.inputs[0].numChannels, data.inputs[0], frames, sampleSize, offset);
         
         if(mSidechainActive)
-          AttachBuffers(ERoute::kInput, mMaxNChansForMainInputBus, data.inputs[1].numChannels, data.inputs[1], data.numSamples, sampleSize);
+          AttachBuffers(ERoute::kInput, mMaxNChansForMainInputBus, data.inputs[1].numChannels, data.inputs[1], frames, sampleSize, offset);
       }
       else
       {
         SetChannelConnections(ERoute::kInput, 0, MaxNChannels(ERoute::kInput), false);
         SetChannelConnections(ERoute::kInput, 0, data.inputs[0].numChannels, true);
-        AttachBuffers(ERoute::kInput, 0, data.inputs[0].numChannels, data.inputs[0], data.numSamples, sampleSize);
+        AttachBuffers(ERoute::kInput, 0, data.inputs[0].numChannels, data.inputs[0], frames, sampleSize, offset);
       }
     }
     
@@ -392,16 +430,16 @@ void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup
       int busChannels = data.outputs[outBus].numChannels;
       SetChannelConnections(ERoute::kOutput, chanOffset, busChannels, outs[outBus].get()->isActive());
       SetChannelConnections(ERoute::kOutput, chanOffset + busChannels, MaxNChannels(ERoute::kOutput) - (chanOffset + busChannels), false);
-      AttachBuffers(ERoute::kOutput, chanOffset, busChannels, data.outputs[outBus], data.numSamples, sampleSize);
+      AttachBuffers(ERoute::kOutput, chanOffset, busChannels, data.outputs[outBus], frames, sampleSize, offset);
       chanOffset += busChannels;
     }
     
     if (GetBypassed())
     {
       if (sampleSize == kSample32)
-        PassThroughBuffers(0.f, data.numSamples); // single precision
+        PassThroughBuffers(0.f, frames); // single precision
       else
-        PassThroughBuffers(0.0, data.numSamples); // double precision
+        PassThroughBuffers(0.0, frames); // double precision
     }
     else
     {
@@ -409,9 +447,9 @@ void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup
       mPlug.mParams_mutex.Enter();
 #endif
       if (sampleSize == kSample32)
-        ProcessBuffers(0.f, data.numSamples); // single precision
+        ProcessBuffers(0.f, frames); // single precision
       else
-        ProcessBuffers(0.0, data.numSamples); // double precision
+        ProcessBuffers(0.0, frames); // double precision
 #ifdef PARAMS_MUTEX
       mPlug.mParams_mutex.Leave();
 #endif
@@ -419,9 +457,90 @@ void IPlugVST3ProcessorBase::ProcessAudio(ProcessData& data, ProcessSetup& setup
   }
 }
 
+#if IPLUG_VST3_SAMPLE_ACCURATE_PARAMS
+bool IPlugVST3ProcessorBase::ProcessSampleAccurate(ProcessData& data, ProcessSetup& setup, const BusList& ins, const BusList& outs, IPlugQueue<IMidiMsg>& fromProcessor)
+{
+  IParameterChanges* paramChanges = data.inputParameterChanges;
+
+  // MIDI I/O keeps the default path: its events carry offsets into the whole block
+  if (!paramChanges || DoesMIDIIn() || DoesMIDIOut() || data.numSamples <= IPLUG_VST3_PARAM_MIN_SEGMENT)
+    return false;
+
+  // AttachBuffers() shifts channel pointers through a fixed size array
+  for (int32 i = 0; i < data.numInputs; i++)
+  {
+    if (data.inputs[i].numChannels > 64)
+      return false;
+  }
+
+  for (int32 i = 0; i < data.numOutputs; i++)
+  {
+    if (data.outputs[i].numChannels > 64)
+      return false;
+  }
+
+  mParamPoints.clear(); // keeps the reserved capacity
+  bool needsSplit = false;
+  uint32_t seq = 0;
+  const int32 numParamsChanged = paramChanges->getParameterCount();
+
+  for (int32 i = 0; i < numParamsChanged; i++)
+  {
+    IParamValueQueue* paramQueue = paramChanges->getParameterData(i);
+
+    if (!paramQueue)
+      continue;
+
+    const int32 numPoints = paramQueue->getPointCount();
+
+    for (int32 p = 0; p < numPoints; p++)
+    {
+      int32 offsetSamples;
+      double value;
+
+      if (paramQueue->getPoint(p, offsetSamples, value) != kResultTrue)
+        continue;
+
+      // More points than reserved: leave the block to the default path rather than allocating here
+      if (mParamPoints.size() == mParamPoints.capacity())
+        return false;
+
+      mParamPoints.push_back({offsetSamples, seq++, static_cast<int32_t>(paramQueue->getParameterId()), value});
+
+      if (offsetSamples >= IPLUG_VST3_PARAM_MIN_SEGMENT)
+        needsSplit = true;
+    }
+  }
+
+  // Nothing changes after the first few samples: the default path (all values applied at the start) is equivalent
+  if (!needsSplit)
+    return false;
+
+  SortVST3ParamPoints(mParamPoints.data(), mParamPoints.size());
+
+  ProcessWithVST3ParamSegments(
+    mParamPoints.data(), mParamPoints.size(), data.numSamples, IPLUG_VST3_PARAM_MIN_SEGMENT,
+    [&](const VST3ParamPoint& point) {
+      // the point is applied right before its sub-block, so it takes effect at sample 0 of that sub-block
+      ApplyParameterChange(point.paramID, point.value, 0, fromProcessor);
+    },
+    [&](int32_t startSample, int32_t numFrames) {
+      ProcessAudio(data, setup, ins, outs, startSample, numFrames);
+    });
+
+  return true;
+}
+#endif
+
 void IPlugVST3ProcessorBase::Process(ProcessData& data, ProcessSetup& setup, const BusList& ins, const BusList& outs, IPlugQueue<IMidiMsg>& fromEditor, IPlugQueue<IMidiMsg>& fromProcessor, IPlugQueue<SysExData>& sysExFromEditor, SysExData& sysExBuf)
 {
   PrepareProcessContext(data, setup);
+
+#if IPLUG_VST3_SAMPLE_ACCURATE_PARAMS
+  if (ProcessSampleAccurate(data, setup, ins, outs, fromProcessor))
+    return;
+#endif
+
   ProcessParameterChanges(data, fromProcessor);
   
   if (DoesMIDIIn())

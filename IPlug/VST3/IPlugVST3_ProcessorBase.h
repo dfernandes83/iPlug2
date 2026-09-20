@@ -18,6 +18,28 @@
 #include "IPlugAPIBase.h"
 #include "IPlugProcessor.h"
 #include "IPlugVST3_Defs.h"
+#include "IPlugVST3_ParamSegments.h"
+
+/** Set to 1 to apply the host's VST3 parameter automation sample-accurately (iPlug2 issue #780).
+ * By default only the last point of each parameter queue is applied, at the start of the block, which turns smooth
+ * automation into one step per block. When enabled, a block that carries automation points is split at those points
+ * and OnParamChange() runs right before each sub-block. Blocks without such points, and plug-ins with MIDI I/O, are
+ * processed exactly as before. Off by default so plug-ins opt in explicitly. */
+#ifndef IPLUG_VST3_SAMPLE_ACCURATE_PARAMS
+  #define IPLUG_VST3_SAMPLE_ACCURATE_PARAMS 0
+#endif
+
+/** Shortest sub-block used when splitting for sample-accurate automation. Points closer together than this are applied
+ * together, which bounds the per-block ProcessBlock() call overhead however dense the host's automation is. */
+#ifndef IPLUG_VST3_PARAM_MIN_SEGMENT
+  #define IPLUG_VST3_PARAM_MIN_SEGMENT 32
+#endif
+
+/** Capacity reserved up front (not on the audio thread) for the automation points of one block. If a host sends more,
+ * the block falls back to the default last-point behaviour. */
+#ifndef IPLUG_VST3_MAX_PARAM_POINTS
+  #define IPLUG_VST3_MAX_PARAM_POINTS 4096
+#endif
 
 // Custom bus type function (in global namespace)
 #ifdef CUSTOM_BUSTYPE_FUNC
@@ -177,7 +199,8 @@ public:
     return false;
   }
   
-  void AttachBuffers(ERoute direction, int idx, int n, Steinberg::Vst::AudioBusBuffers& pBus, int nFrames, Steinberg::int32 sampleSize);
+  /** @param offset first sample of the bus buffers to attach, used when a block is processed in sub-blocks */
+  void AttachBuffers(ERoute direction, int idx, int n, Steinberg::Vst::AudioBusBuffers& pBus, int nFrames, Steinberg::int32 sampleSize, int offset = 0);
   bool SetupProcessing(const Steinberg::Vst::ProcessSetup& setup, Steinberg::Vst::ProcessSetup& storedSetup);
   bool CanProcessSampleSize(Steinberg::int32 symbolicSampleSize);
   bool SetProcessing(bool state);
@@ -185,13 +208,23 @@ public:
   // Audio Processing
   void PrepareProcessContext(Steinberg::Vst::ProcessData& data, Steinberg::Vst::ProcessSetup& setup);
   void ProcessParameterChanges(Steinberg::Vst::ProcessData& data, IPlugQueue<IMidiMsg>& fromProcessor);
-  void ProcessAudio(Steinberg::Vst::ProcessData& data, Steinberg::Vst::ProcessSetup& setup, const Steinberg::Vst::BusList& ins, const Steinberg::Vst::BusList& outs);
+  /** Applies one host parameter value (bypass, plug-in parameter or MIDI CC) at \c offsetSamples in the current block */
+  void ApplyParameterChange(int idx, double value, int offsetSamples, IPlugQueue<IMidiMsg>& fromProcessor);
+  /** @param offset,nFrames process only this slice of the block; nFrames < 0 means the whole block */
+  void ProcessAudio(Steinberg::Vst::ProcessData& data, Steinberg::Vst::ProcessSetup& setup, const Steinberg::Vst::BusList& ins, const Steinberg::Vst::BusList& outs, int offset = 0, int nFrames = -1);
   void Process(Steinberg::Vst::ProcessData& data, Steinberg::Vst::ProcessSetup& setup, const Steinberg::Vst::BusList& ins, const Steinberg::Vst::BusList& outs, IPlugQueue<IMidiMsg>& fromEditor, IPlugQueue<IMidiMsg>& fromProcessor, IPlugQueue<SysExData>& sysExFromEditor, SysExData& sysExBuf);
   
   // IPlugProcessor overrides
   bool SendMidiMsg(const IMidiMsg& msg) override;
 
 private:
+#if IPLUG_VST3_SAMPLE_ACCURATE_PARAMS
+  /** Processes the block in sub-blocks split at the host's automation points.
+   * @return false if the block should be handled by the default path instead, in which case nothing has been applied */
+  bool ProcessSampleAccurate(Steinberg::Vst::ProcessData& data, Steinberg::Vst::ProcessSetup& setup, const Steinberg::Vst::BusList& ins, const Steinberg::Vst::BusList& outs, IPlugQueue<IMidiMsg>& fromProcessor);
+
+  std::vector<VST3ParamPoint> mParamPoints; // reserved once, never grown on the audio thread
+#endif
   int mMaxNChansForMainInputBus = 0;
   IPlugAPIBase& mPlug;
   Steinberg::Vst::ProcessContext mProcessContext;
