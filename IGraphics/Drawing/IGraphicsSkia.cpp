@@ -713,11 +713,22 @@ void IGraphicsSkia::PrepareAndMeasureText(const IText& text, const char* str, IR
   
   assert(pFont && "No font found - did you forget to load it?");
 
-  font.setTypeface(pFont->mTypeface);
+  // pFont can be null in release builds (assert() above is compiled out there) when a draw
+  // races the font cache - e.g. a UI timer tick landing before LoadAPIFont() populates
+  // sFontCache. Falling back to SkFont's own default typeface/size keeps this a visibly
+  // wrong glyph instead of a null-pointer crash.
+  if (pFont)
+  {
+    font.setTypeface(pFont->mTypeface);
+    font.setSize(text.mSize * pFont->mData->GetHeightEMRatio());
+  }
+  else
+  {
+    font.setSize(text.mSize);
+  }
   font.setHinting(SkFontHinting::kSlight);
   font.setForceAutoHinting(false);
   font.setSubpixel(true);
-  font.setSize(text.mSize * pFont->mData->GetHeightEMRatio());
   
   // Draw / measure
   const double textWidth = font.measureText(str, strlen(str), SkTextEncoding::kUTF8, nullptr/* &bounds*/);

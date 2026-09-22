@@ -303,7 +303,22 @@ if(NOT TARGET iPlug2::IGraphics::Skia)
   target_link_libraries(iPlug2::IGraphics::Skia INTERFACE iPlug2::IGraphics)
   target_compile_definitions(iPlug2::IGraphics::Skia INTERFACE IGRAPHICS_SKIA)
 
-  set(SKIA_PATH ${DEPS_DIR}/Build/src/skia)
+  # SKIA_ROOT (env var) overrides the default in-tree Dependencies/Build/src/skia
+  # location with a prebuilt Skia bundle at ${SKIA_ROOT}/src/skia (headers) +
+  # ${SKIA_ROOT}/<platform>/<config> (libs, split by build config) - the convention
+  # already used by this org's downstream plugins. No machine-specific default:
+  # falls back to iPlug2's own layout when SKIA_ROOT is unset, so vanilla iPlug2
+  # consumers relying on setup-deps are unaffected.
+  if(DEFINED ENV{SKIA_ROOT} AND NOT "$ENV{SKIA_ROOT}" STREQUAL "")
+    set(SKIA_ROOT "$ENV{SKIA_ROOT}" CACHE PATH "Path to a prebuilt Skia bundle (headers + libs)")
+  endif()
+
+  if(SKIA_ROOT)
+    set(SKIA_PATH ${SKIA_ROOT}/src/skia)
+  else()
+    set(SKIA_PATH ${DEPS_DIR}/Build/src/skia)
+  endif()
+
   target_include_directories(iPlug2::IGraphics::Skia INTERFACE
     ${SKIA_PATH}
     ${SKIA_PATH}/include
@@ -314,11 +329,30 @@ if(NOT TARGET iPlug2::IGraphics::Skia)
     ${SKIA_PATH}/include/utils/mac
     ${SKIA_PATH}/include/gpu
     ${SKIA_PATH}/include/private
+    ${SKIA_PATH}/include/encode
     ${SKIA_PATH}/modules/svg/include
     ${SKIA_PATH}/modules/skcms
   )
 
-  if(WIN32)
+  if(WIN32 AND SKIA_ROOT)
+    # Prebuilt bundle layout: ${SKIA_ROOT}/win/x64/{Debug,Release}/<name>.lib,
+    # freetype headers at ${SKIA_ROOT}/src/freetype/include. The bundle carries
+    # freetype/libpng/zlib as separate static libs (not folded into skia.lib).
+    target_include_directories(iPlug2::IGraphics::Skia INTERFACE
+      ${SKIA_ROOT}/src/freetype/include
+    )
+    function(_iplug_skia_root_lib OUT_VAR NAME)
+      set(${OUT_VAR}
+        $<$<CONFIG:Debug>:${SKIA_ROOT}/win/x64/Debug/${NAME}.lib>
+        $<$<NOT:$<CONFIG:Debug>>:${SKIA_ROOT}/win/x64/Release/${NAME}.lib>
+        PARENT_SCOPE
+      )
+    endfunction()
+    foreach(_lib skia skottie sksg skshaper skparagraph skunicode_core skunicode_icu svg freetype libpng zlib)
+      _iplug_skia_root_lib(_iplug_skia_lib_${_lib} ${_lib})
+      target_link_libraries(iPlug2::IGraphics::Skia INTERFACE ${_iplug_skia_lib_${_lib}})
+    endforeach()
+  elseif(WIN32)
     set(SKIA_LIB_PATH ${SKIA_PATH}/out/Release-x64)
     target_link_libraries(iPlug2::IGraphics::Skia INTERFACE
       ${SKIA_LIB_PATH}/skia.lib
@@ -367,6 +401,13 @@ if(NOT TARGET iPlug2::IGraphics::Skia::GL3)
   if(APPLE)
     target_link_libraries(iPlug2::IGraphics::Skia::GL3 INTERFACE
       "-framework OpenGL"
+    )
+  elseif(WIN32)
+    # IGraphicsWin.cpp unity-includes glad.c regardless of drawing backend, so
+    # Skia+GL3 needs the same glad_GL3 include dirs NanoVG::GL3 already carries.
+    target_include_directories(iPlug2::IGraphics::Skia::GL3 INTERFACE
+      ${IGRAPHICS_DEPS_DIR}/glad_GL3/include
+      ${IGRAPHICS_DEPS_DIR}/glad_GL3/src
     )
   endif()
 
