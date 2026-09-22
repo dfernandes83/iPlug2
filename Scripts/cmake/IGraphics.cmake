@@ -358,6 +358,21 @@ if(NOT TARGET iPlug2::IGraphics::Skia)
       ${SKIA_LIB_PATH}/skia.lib
       ${SKIA_LIB_PATH}/svg.lib
     )
+  elseif(APPLE AND SKIA_ROOT)
+    # Prebuilt bundle layout: ${SKIA_ROOT}/mac/arm64/{Debug,Release}/lib<name>.a,
+    # same SKIA_ROOT convention as the WIN32 branch above. The bundle carries
+    # freetype/libpng/zlib as separate static libs (not folded into libskia.a).
+    function(_iplug_skia_root_lib OUT_VAR NAME)
+      set(${OUT_VAR}
+        $<$<CONFIG:Debug>:${SKIA_ROOT}/mac/arm64/Debug/lib${NAME}.a>
+        $<$<NOT:$<CONFIG:Debug>>:${SKIA_ROOT}/mac/arm64/Release/lib${NAME}.a>
+        PARENT_SCOPE
+      )
+    endfunction()
+    foreach(_lib skia svg skshaper skparagraph skunicode_core skunicode_icu freetype libpng zlib)
+      _iplug_skia_root_lib(_iplug_skia_lib_${_lib} ${_lib})
+      target_link_libraries(iPlug2::IGraphics::Skia INTERFACE ${_iplug_skia_lib_${_lib}})
+    endforeach()
   elseif(APPLE)
     set(SKIA_LIB_PATH ${DEPS_DIR}/Build/mac/lib)
     target_link_libraries(iPlug2::IGraphics::Skia INTERFACE
