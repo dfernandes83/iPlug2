@@ -1072,7 +1072,7 @@ void IGraphics::OnMouseDown(const std::vector<IMouseInfo>& points)
 void IGraphics::OnMouseUp(const std::vector<IMouseInfo>& points)
 {
 //  Trace("IGraphics::OnMouseUp", __LINE__, "x:%0.2f, y:%0.2f, mod:LRSCA: %i%i%i%i%i", x, y, mod.L, mod.R, mod.S, mod.C, mod.A);
-  
+
   if (ControlIsCaptured())
   {
     for (auto& point : points)

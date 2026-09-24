@@ -470,6 +470,17 @@ void IGraphicsSkia::DrawResize()
   // DrawResize() there -- see that function), is the same fix upstream shipped for NanoVG, just
   // applied to every branch below instead of one NanoVG-specific FBO call. See docs/decisions.md and
   // docs/iplug2-fork-status.md for the fuller investigation and owner authorization.
+  //
+  // That guard only covers drags that go through IGraphics::StartDragResize()/mResizingInProcess
+  // -- i.e. AttachCornerResizer's own triangle. A host offering its own native window-resize
+  // handle under PLUG_HOST_RESIZE (confirmed via tracing in REAPER: AbsoluteStereoTape) drives
+  // IGraphics::Resize() directly with mResizingInProcess permanently false, so it never hits the
+  // early-return above -- this function reallocates a brand new mSurface on every single tick of
+  // that drag instead. SkSurfaces::Raster()/RenderTarget() below hand back uninitialized memory,
+  // and until the next full repaint finishes painting over it, that shows through as a solid
+  // block of GPU/raster garbage (reported as "creates a pink area"). Clearing right after
+  // allocation, below, removes that window regardless of which resize path (or backend) got us
+  // here.
   if (GetResizingInProcess())
     return;
 
@@ -510,6 +521,9 @@ void IGraphicsSkia::DrawResize()
   if (mSurface)
   {
     mCanvas = mSurface->getCanvas();
+    // Fresh allocation above is uninitialized memory; clear it so a resize never exposes raw
+    // GPU/raster garbage for the frames between this reallocation and the next full repaint.
+    mCanvas->clear(SK_ColorTRANSPARENT);
     mCanvas->save();
   }
 }
